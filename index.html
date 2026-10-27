@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Station">
+<meta name="theme-color" content="#000000">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-512.png">
+<title>Listening Station</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+  html, body { margin: 0; height: 100%; background: #000; color: #8a8a8a;
+    font: 16px/1.4 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif;
+    -webkit-user-select: none; user-select: none; overscroll-behavior: none; }
+
+  /* ---------- Setup (operator only) ---------- */
+  #setup { max-width: 560px; margin: 0 auto; padding: 48px 20px; }
+  #setup h1 { font-size: 20px; color: #ddd; font-weight: 600; margin: 0 0 4px; }
+  #setup p { margin: 6px 0; font-size: 14px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; margin: 20px 0; }
+  button, label.btn { appearance: none; border: 1px solid #444; background: #111; color: #ddd;
+    padding: 14px 18px; border-radius: 10px; font: inherit; cursor: pointer; }
+  button.primary { background: #ddd; color: #000; border-color: #ddd; font-weight: 600; }
+  button:disabled { opacity: .35; }
+  input[type=file] { display: none; }
+  #list { margin: 12px 0 0; padding: 0; list-style: none; font-size: 13px; max-height: 40vh; overflow: auto;
+    border-top: 1px solid #222; }
+  #list li { padding: 6px 0; border-bottom: 1px solid #1a1a1a; display: flex; justify-content: space-between; gap: 12px; }
+  #list li span:last-child { color: #555; white-space: nowrap; }
+  #status { font-size: 13px; color: #6a6; min-height: 1.4em; }
+  #status.err { color: #c66; }
+  .small { font-size: 12px; color: #555; }
+
+  /* ---------- Play mode: pure black, nothing on screen ---------- */
+  #stage { position: fixed; inset: 0; background: #000; display: none; }
+  body.playing #setup { display: none; }
+  body.playing #stage { display: block; }
+  /* Hidden exit zone: hold top-left corner for 4 s */
+  #exit { position: absolute; left: 0; top: 0; width: 90px; height: 90px; }
+</style>
+</head>
+<body>
+
+<div id="setup">
+  <h1>Listening Station</h1>
+  <p>Operator setup. Load the loop once, then press Start. The screen goes black and the tracks repeat until the app is closed.</p>
+
+  <div class="row">
+    <label class="btn" for="pick">Add tracks…</label>
+    <input id="pick" type="file" multiple accept="audio/*,.flac,.m4a,.alac,.wav,.aif,.aiff,.mp3">
+    <button id="clear">Clear all</button>
+    <button id="start" class="primary" disabled>Start loop</button>
+  </div>
+
+  <div id="status"></div>
+  <ul id="list"></ul>
+  <p class="small" id="meta"></p>
+  <p class="small">Tracks play in filename order (prefix 01-, 02-…). To return here during playback, press and hold the top-left corner for 4 seconds.</p>
+</div>
+
+<div id="stage"><div id="exit"></div></div>
+
+<audio id="a0" preload="auto" playsinline></audio>
+<audio id="a1" preload="auto" playsinline></audio>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---------- IndexedDB (tracks stored as Blobs, fully offline) ----------
+  const DB = 'listening-station', STORE = 'tracks';
+  const openDB = () => new Promise((res, rej) => {
+    const r = indexedDB.open(DB, 1);
+    r.onupgradeneeded = () => r.result.createObjectStore(STORE, { keyPath: 'name' });
+    r.onsuccess = () => res(r.result);
+    r.onerror = () => rej(r.error);
+  });
+  const tx = async (mode, fn) => {
+    const db = await openDB();
+    return new Promise((res, rej) => {
+      const t = db.transaction(STORE, mode);
+      const out = fn(t.objectStore(STORE));
+      t.oncomplete = () => res(out && out.result !== undefined ? out.result : out);
+      t.onerror = () => rej(t.error);
+      t.onabort = () => rej(t.error);
+    });
+  };
+  const putTrack = (rec) => tx('readwrite', s => s.put(rec));
+  const allTracks = () => tx('readonly', s => s.getAll());
+  const clearTracks = () => tx('readwrite', s => s.clear());
+
+  // ---------- UI ----------
+  const $ = id => document.getElementById(id);
+  const statusEl = $('status');
+  const say = (msg, err) => { statusEl.textContent = msg; statusEl.className = err ? 'err' : ''; };
+  const fmtMB = b => (b / 1048576).toFixed(1) + ' MB';
+  const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
+
+  let tracks = []; // [{name, type, size, blob}]
+
+  async function refresh() {
+    tracks = (await allTracks()).sort((a, b) => collator.compare(a.name, b.name));
+    const list = $('list'); list.innerHTML = '';
+    let total = 0;
+    tracks.forEach((t, i) => {
+      total += t.size;
+      const li = document.createElement('li');
+      const a = document.createElement('span'); a.textContent = `${String(i + 1).padStart(2, '0')}  ${t.name}`;
+      const b = document.createElement('span'); b.textContent = fmtMB(t.size);
+      li.append(a, b); list.append(li);
+    });
+    $('start').disabled = tracks.length === 0;
+    let meta = `${tracks.length} track${tracks.length === 1 ? '' : 's'} · ${fmtMB(total)}`;
+    try {
+      if (navigator.storage && navigator.storage.estimate) {
+        const e = await navigator.storage.estimate();
+        meta += ` · storage used ${fmtMB(e.usage || 0)} of ${fmtMB(e.quota || 0)}`;
+      }
+      if (navigator.storage && navigator.storage.persisted) {
+        meta += (await navigator.storage.persisted()) ? ' · persistent' : ' · not yet persistent';
+      }
+    } catch (_) {}
+    $('meta').textContent = meta;
+  }
+
+  $('pick').addEventListener('change', async (ev) => {
+    const files = [...ev.target.files];
+    ev.target.value = '';
+    if (!files.length) return;
+    try { if (navigator.storage && navigator.storage.persist) await navigator.storage.persist(); } catch (_) {}
+    let n = 0;
+    for (const f of files) {
+      say(`Saving ${++n}/${files.length}: ${f.name}`);
+      // Probe playability before storing
+      const probe = document.createElement('audio');
+      const type = f.type || guessType(f.name);
+      if (type && probe.canPlayType(type) === '') { say(`Skipped (format not playable here): ${f.name}`, true); continue; }
+      try {
+        // Copy into a fresh Blob so it survives the file picker's temporary access
+        const buf = await f.arrayBuffer();
+        await putTrack({ name: f.name, type, size: f.size, blob: new Blob([buf], { type }) });
+      } catch (e) { say(`Could not save ${f.name}: ${e && e.message || e}`, true); return; }
+    }
+    say(`Saved ${files.length} file${files.length === 1 ? '' : 's'}. Ready.`);
+    refresh();
+  });
+
+  function guessType(name) {
+    const ext = name.split('.').pop().toLowerCase();
+    return ({ flac: 'audio/flac', m4a: 'audio/mp4', alac: 'audio/mp4', mp4: 'audio/mp4', wav: 'audio/wav',
+      aif: 'audio/aiff', aiff: 'audio/aiff', mp3: 'audio/mpeg' })[ext] || '';
+  }
+
+  $('clear').addEventListener('click', async () => {
+    if (!tracks.length) return;
+    await clearTracks(); say('Cleared.'); refresh();
+  });
+
+  // ---------- Player: two <audio> elements, next track pre-buffered ----------
+  const decks = [$('a0'), $('a1')];
+  let cur = 0, idx = 0, urls = [], running = false, wakeLock = null, watchdog = null;
+
+  function urlFor(i) { return urls[i % urls.length]; }
+
+  function load(deck, i) { deck.src = urlFor(i); deck.load(); }
+
+  async function playDeck(deck) {
+    try { await deck.play(); }
+    catch (e) { setTimeout(() => running && deck.paused && deck.play().catch(() => {}), 1500); }
+  }
+
+  function advance() {
+    if (!running) return;
+    const prev = decks[cur];
+    idx = (idx + 1) % urls.length;
+    cur ^= 1;
+    const next = decks[cur];
+    if (urls.length === 1) { prev.currentTime = 0; cur ^= 1; playDeck(prev); return; }
+    playDeck(next);
+    // pre-buffer the one after into the deck we just finished
+    load(prev, idx + 1);
+  }
+
+  decks.forEach(d => {
+    d.addEventListener('ended', () => { if (d === decks[cur]) advance(); });
+    d.addEventListener('error', () => { if (running && d === decks[cur]) setTimeout(advance, 500); });
+  });
+
+  async function requestWake() {
+    try { if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen'); } catch (_) {}
+  }
+
+  async function start() {
+    if (!tracks.length) return;
+    urls.forEach(u => URL.revokeObjectURL(u));
+    urls = tracks.map(t => URL.createObjectURL(t.blob));
+    running = true; idx = 0; cur = 0;
+    document.body.classList.add('playing');
+    load(decks[0], 0);
+    if (urls.length > 1) load(decks[1], 1);
+    // Unlock the second deck inside this user gesture (iOS requires a gesture per element)
+    decks[1].muted = true; decks[1].play().then(() => { decks[1].pause(); decks[1].currentTime = 0; decks[1].muted = false; }).catch(() => { decks[1].muted = false; });
+    await playDeck(decks[0]);
+    requestWake();
+    // Watchdog: resume if iOS pauses the current deck unexpectedly
+    clearInterval(watchdog);
+    watchdog = setInterval(() => {
+      const d = decks[cur];
+      if (running && d.paused && !d.ended) playDeck(d);
+      if (running && d.ended) advance();
+    }, 5000);
+  }
+
+  function stop() {
+    running = false; clearInterval(watchdog);
+    decks.forEach(d => { d.pause(); d.removeAttribute('src'); d.load(); });
+    try { wakeLock && wakeLock.release(); } catch (_) {}
+    document.body.classList.remove('playing');
+    refresh();
+  }
+
+  $('start').addEventListener('click', start);
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && running) { requestWake(); const d = decks[cur]; if (d.paused) playDeck(d); }
+  });
+
+  // Hidden exit: hold top-left corner 4 s
+  let holdT = null;
+  const exitZone = $('exit');
+  exitZone.addEventListener('touchstart', e => { e.preventDefault(); holdT = setTimeout(stop, 4000); }, { passive: false });
+  exitZone.addEventListener('touchend', () => clearTimeout(holdT));
+  exitZone.addEventListener('mousedown', () => { holdT = setTimeout(stop, 4000); });
+  exitZone.addEventListener('mouseup', () => clearTimeout(holdT));
+  // Block stray gestures in play mode
+  $('stage').addEventListener('touchmove', e => e.preventDefault(), { passive: false });
+
+  // ---------- Offline shell ----------
+  if ('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js').catch(() => {});
+
+  refresh().catch(e => say('Storage unavailable: ' + (e && e.message || e), true));
+
+  // test hook
+  window.__station = { start, stop, refresh, get state() { return { running, idx, cur, n: urls.length }; } };
+})();
+</script>
+</body>
+</html>

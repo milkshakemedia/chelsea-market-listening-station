@@ -1,0 +1,8 @@
+# Never commit audio
+*.flac
+*.m4a
+*.wav
+*.aif
+*.aiff
+*.mp3
+.DS_Store
